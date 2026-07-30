@@ -45,11 +45,13 @@ def configure_paths(
     *,
     root: Path | str | None = None,
     input_dir: Path | str | None = None,
+    rate_input_dir: Path | str | None = None,
+    fsc_input_dir: Path | str | None = None,
     processing_dir: Path | str | None = None,
     output_dir: Path | str | None = None,
 ) -> None:
     """Override data folder locations (for Colab / Google Drive)."""
-    global ROOT, INPUT_DIR, PROCESSING_DIR, OUTPUT_DIR
+    global ROOT, INPUT_DIR, RATE_INPUT_DIR, FSC_INPUT_DIR, PROCESSING_DIR, OUTPUT_DIR
 
     if root is not None:
         ROOT = Path(root).expanduser().resolve()
@@ -60,11 +62,23 @@ def configure_paths(
     if output_dir is not None:
         OUTPUT_DIR = Path(output_dir).expanduser().resolve()
 
+    if rate_input_dir is not None:
+        RATE_INPUT_DIR = Path(rate_input_dir).expanduser().resolve()
+    else:
+        RATE_INPUT_DIR = INPUT_DIR / "rate"
+
+    if fsc_input_dir is not None:
+        FSC_INPUT_DIR = Path(fsc_input_dir).expanduser().resolve()
+    else:
+        FSC_INPUT_DIR = INPUT_DIR / "fsc"
+
 
 def configure_paths_from_env() -> None:
     """Apply GAR_* environment variables and Colab Drive defaults when available."""
     root = _path_from_env("GAR_ROOT")
     input_dir = _path_from_env("GAR_INPUT_DIR")
+    rate_input_dir = _path_from_env("GAR_RATE_INPUT_DIR")
+    fsc_input_dir = _path_from_env("GAR_FSC_INPUT_DIR")
     processing_dir = _path_from_env("GAR_PROCESSING_DIR")
     output_dir = _path_from_env("GAR_OUTPUT_DIR")
 
@@ -75,10 +89,15 @@ def configure_paths_from_env() -> None:
             processing_dir = drive_base / "processing"
             output_dir = drive_base / "output"
 
-    if any(path is not None for path in (root, input_dir, processing_dir, output_dir)):
+    if any(
+        path is not None
+        for path in (root, input_dir, rate_input_dir, fsc_input_dir, processing_dir, output_dir)
+    ):
         configure_paths(
             root=root or ROOT,
             input_dir=input_dir or (root / "input" if root is not None else INPUT_DIR),
+            rate_input_dir=rate_input_dir,
+            fsc_input_dir=fsc_input_dir,
             processing_dir=processing_dir or (root / "processing" if root is not None else PROCESSING_DIR),
             output_dir=output_dir or (root / "output" if root is not None else OUTPUT_DIR),
         )
