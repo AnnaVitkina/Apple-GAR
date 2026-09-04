@@ -38,6 +38,7 @@ from carrier_rules import (
     carrier_includes_od_alternative_gateway,
     compute_lane_valid_to,
     detect_carrier,
+    rc_valid_to_from_dataframe,
     remove_additional_lane_rows,
 )
 from project_paths import OUTPUT_DIR, PROCESSING_DIR, ensure_workspace_dirs
@@ -692,6 +693,7 @@ def _shipment_values(
     transport_periods: list[PeriodColumn] | None = None,
     fuel_periods: list[PeriodColumn] | None = None,
     has_fuel_on_lane: bool = False,
+    rc_valid_to_override: object | None = None,
 ) -> dict[str, object]:
     uplift = cell_text(row.get("Uplift Airport"))
     origin_city = cell_text(row.get("Origin City"))
@@ -703,6 +705,7 @@ def _shipment_values(
             transport_periods=transport_periods,
             fuel_periods=fuel_periods or [],
             has_fuel_on_lane=has_fuel_on_lane,
+            rc_valid_to_override=rc_valid_to_override,
         )
     else:
         valid_to = format_display_date(row.get("Valid To_5") or row.get("Valid To"))
@@ -745,6 +748,7 @@ def build_base_freight_rows(
     fuel_df: pd.DataFrame | None,
     fuel_specs: list[CostSpec],
     fuel_periods: list[PeriodColumn],
+    rc_valid_to_override: object | None = None,
 ) -> list[dict[str, object]]:
     fuel_lookup: dict[tuple[str, ...], pd.Series] = {}
     if fuel_df is not None and not fuel_df.empty:
@@ -764,6 +768,7 @@ def build_base_freight_rows(
             transport_periods=transport_periods,
             fuel_periods=fuel_periods,
             has_fuel_on_lane=bool(has_fuel),
+            rc_valid_to_override=rc_valid_to_override,
         )
         for spec in transport_specs:
             record[spec.currency_column] = ""
@@ -829,6 +834,7 @@ def build_od_rows(
     fuel_lookup: dict[tuple[str, ...], pd.Series],
     transport_periods: list[PeriodColumn],
     fuel_periods: list[PeriodColumn],
+    rc_valid_to_override: object | None = None,
 ) -> list[dict[str, object]]:
     value_column = OD_VALUE_COLUMN if OD_VALUE_COLUMN in df.columns else None
     if value_column is None:
@@ -861,6 +867,7 @@ def build_od_rows(
             transport_periods=transport_periods,
             fuel_periods=fuel_periods,
             has_fuel_on_lane=has_fuel,
+            rc_valid_to_override=rc_valid_to_override,
         )
         record["Service"] = ACCESSORIAL_SERVICE_SPECIAL
         record["Service Product"] = ACCESSORIAL_SERVICE_SPECIAL
@@ -892,6 +899,7 @@ def build_matrix_dataframe(processing_path: Path) -> tuple[pd.DataFrame, list[Co
         )
 
     base_df = pd.read_excel(processing_path, sheet_name=sheet_map[BASE_FREIGHT_TAB])
+    rc_valid_to_override = rc_valid_to_from_dataframe(base_df)
     transport_periods = discover_transport_periods(base_df)
     if not transport_periods:
         raise RuntimeError("No transport value periods found in Base Freight Rates.")
@@ -922,6 +930,7 @@ def build_matrix_dataframe(processing_path: Path) -> tuple[pd.DataFrame, list[Co
         fuel_df=fuel_df,
         fuel_specs=fuel_specs,
         fuel_periods=fuel_periods,
+        rc_valid_to_override=rc_valid_to_override,
     )
 
     active_measurements: list[str] = []
@@ -961,6 +970,7 @@ def build_matrix_dataframe(processing_path: Path) -> tuple[pd.DataFrame, list[Co
                 fuel_lookup=fuel_lookup,
                 transport_periods=transport_periods,
                 fuel_periods=fuel_periods,
+                rc_valid_to_override=rc_valid_to_override,
             )
         )
 
@@ -996,6 +1006,12 @@ def build_matrix_dataframe(processing_path: Path) -> tuple[pd.DataFrame, list[Co
     vn_carrier_rows = append_sch_vn_carrier_rows(matrix_rows, carrier)
     if vn_carrier_rows:
         print(f"  - SCH Vietnam carrier rows added: {vn_carrier_rows}")
+
+    if rc_valid_to_override is not None:
+        rc_display = format_display_date(rc_valid_to_override)
+        if rc_display:
+            for row in matrix_rows:
+                row["Valid to"] = rc_display
 
     cost_specs = [*transport_specs, *fuel_specs, *od_specs]
 
