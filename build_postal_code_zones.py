@@ -22,7 +22,15 @@ from build_matrix import (
     cell_text,
 )
 from country_codes import to_country_iso
-from location_names import location_match_key, locations_equivalent
+from location_names import (
+    FOREIGN_CITIES_BY_AMBIGUOUS_SUFFIX,
+    foreign_country_for_ambiguous_suffix,
+    is_boilerplate_cluster_member,
+    is_excluded_cluster_member,
+    is_misclassified_foreign_us_city,
+    location_match_key,
+    locations_equivalent,
+)
 from project_paths import OUTPUT_DIR, RATE_INPUT_DIR, ensure_workspace_dirs
 from us_ca_city_states import format_us_ca_postal_city
 
@@ -32,6 +40,22 @@ ALL_LANES_PATTERN = re.compile(r"all\s+([A-Za-z]{2})\s+lanes", re.IGNORECASE)
 US_ZONE_PATTERN = re.compile(r"^US\s+Zone\s+(.+)$", re.IGNORECASE)
 CANADA_ZONE_PATTERN = re.compile(r"^Canada\s+Zone\s+(.+)$", re.IGNORECASE)
 EXCEPT_PHRASE = "except for any cities as listed in this common rating table"
+JP_LANE_EXCEPTION_PATTERN = re.compile(
+    r"except\s+(?:down\s+)?(.+?)(?:\)|$|\.)",
+    re.IGNORECASE,
+)
+METRO_AREA_PATTERN = re.compile(
+    r"the\s+metro\s+area\s+and\s+surrounding\s+communities",
+    re.IGNORECASE,
+)
+
+# States/provinces to append to specific GAR regional zone definitions.
+GAR_US_ZONE_STATE_ADDITIONS: dict[str, list[str]] = {
+    "2": ["HI"],
+}
+GAR_CA_ZONE_PROVINCE_ADDITIONS: dict[str, list[str]] = {
+    "6": ["NL", "NS", "NB", "PE"],
+}
 
 US_STATE_CODES = {
     "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA", "HI", "ID", "IL", "IN",
@@ -147,11 +171,26 @@ def _parse_city_field(text: str, *, default_country: str = "US") -> ParsedCity |
     parts = [part.strip() for part in value.split(",") if part.strip()]
     if len(parts) >= 2:
         last = parts[-1].upper()
-        if last in US_STATE_CODES:
-            return ParsedCity(raw=value, city=parts[0], region=last, country="US")
-        if last in CA_PROVINCE_CODES:
-            return ParsedCity(raw=value, city=parts[0], region=last, country="CA")
+        city_part = ", ".join(parts[:-1]) if len(parts) > 2 else parts[0]
+        foreign_country = foreign_country_for_ambiguous_suffix(city_part, last)
+        if foreign_country:
+            return ParsedCity(raw=value, city=city_part, region="", country=foreign_country)
+        if default_country in {"US", "CA"}:
+            if last in US_STATE_CODES:
+                return ParsedCity(raw=value, city=parts[0], region=last, country="US")
+            if last in CA_PROVINCE_CODES:
+                return ParsedCity(raw=value, city=parts[0], region=last, country="CA")
         if len(last) == 2:
+            if default_country not in {"US", "CA"}:
+                resolved = _normalize_country(last)
+                if resolved and resolved.upper() != default_country.upper() and last not in US_STATE_CODES:
+                    return ParsedCity(
+                        raw=value,
+                        city=city_part,
+                        region="",
+                        country=resolved.upper(),
+                    )
+                return ParsedCity(raw=value, city=value, region="", country=default_country)
             country = _normalize_country(last)
             city = ", ".join(parts[:-1]) if len(parts) > 2 else parts[0]
             return ParsedCity(raw=value, city=city, region="", country=country)
@@ -168,7 +207,7 @@ def _is_anchor_row(c0: str, c1: str) -> bool:
         return False
     if c1 and ALL_LANES_PATTERN.search(c1):
         return True
-    if c1 and "," in c0:
+    if "," in c0:
         return True
     return False
 
@@ -218,16 +257,27 @@ def _parse_state_codes_from_description(description: str) -> list[str]:
     return codes
 
 
-def _parse_canada_postal_prefix(description: str) -> str:
+def _parse_canada_provinces_from_description(description: str) -> list[str]:
     lower = description.lower()
     if EXCEPT_PHRASE in lower:
         lower = lower.split(EXCEPT_PHRASE)[0]
-    for name, code in CANADA_NAME_TO_PROVINCE.items():
-        if name in lower:
-            return code
-    if "manitoba" in lower and "saskatchewan" in lower:
-        return "MB, SK"
-    return ""
+    codes: list[str] = []
+    seen: set[str] = set()
+    if "atlantic" in lower:
+        for code in ("NL", "NS", "NB", "PE"):
+            if code not in seen:
+                codes.append(code)
+                seen.add(code)
+    for name, code in sorted(CANADA_NAME_TO_PROVINCE.items(), key=lambda item: -len(item[0])):
+        if name in lower and code not in seen:
+            codes.append(code)
+            seen.add(code)
+    return codes
+
+
+def _parse_canada_postal_prefix(description: str) -> str:
+    codes = _parse_canada_provinces_from_description(description)
+    return ", ".join(codes)
 
 
 def _parse_regional_zone(c0: str, c1: str) -> RegionalZoneDef | None:
@@ -246,6 +296,9 @@ def _parse_regional_zone(c0: str, c1: str) -> RegionalZoneDef | None:
                 uses_table_exclusions=False,
             )
         state_codes = _parse_state_codes_from_description(c1)
+        for extra in GAR_US_ZONE_STATE_ADDITIONS.get(zone_id, []):
+            if extra not in state_codes:
+                state_codes.append(extra)
         postal = ", ".join(state_codes) if state_codes else c1.split("-")[0].strip().upper()
         return RegionalZoneDef(
             gar_name=gar_name,
@@ -260,16 +313,21 @@ def _parse_regional_zone(c0: str, c1: str) -> RegionalZoneDef | None:
         zone_id = ca_match.group(1).strip()
         gar_name = f"GAR-CA Zone {zone_id}"
         uses_excl = EXCEPT_PHRASE in c1.lower()
-        prefix = _parse_canada_postal_prefix(c1)
-        prov_codes = set()
-        if prefix:
-            for part in prefix.split(","):
-                prov_codes.add(part.strip())
+        seen_prov: set[str] = set()
+        ordered: list[str] = []
+        for code in (
+            *_parse_canada_provinces_from_description(c1),
+            *GAR_CA_ZONE_PROVINCE_ADDITIONS.get(zone_id, []),
+        ):
+            if code and code not in seen_prov:
+                seen_prov.add(code)
+                ordered.append(code)
+        prefix = ", ".join(ordered)
         return RegionalZoneDef(
             gar_name=gar_name,
             country="CA",
             postal_code=prefix or c1.strip(),
-            state_or_prov_codes=prov_codes,
+            state_or_prov_codes=seen_prov,
             uses_table_exclusions=uses_excl,
         )
     return None
@@ -307,8 +365,16 @@ def parse_common_rating_table(raw: pd.DataFrame) -> tuple[list[CityCluster], lis
         if _is_anchor_row(c0, c1):
             flush_cluster()
             if c1 and ALL_LANES_PATTERN.search(c1):
+                lane_match = ALL_LANES_PATTERN.search(c1)
                 anchor = _parse_city_field(c0 or c1)
-                if anchor:
+                if anchor and lane_match:
+                    lane_country = _normalize_country(lane_match.group(1))
+                    anchor = ParsedCity(
+                        raw=anchor.raw,
+                        city=anchor.city,
+                        region=anchor.region,
+                        country=lane_country,
+                    )
                     all_cities.append(anchor)
                 continue
             anchor = _parse_city_field(c0 or c1)
@@ -352,6 +418,8 @@ def _cluster_to_zone(cluster: CityCluster) -> PostalCodeZone:
     tokens: list[str] = []
     seen: set[str] = set()
     for city in cluster.cities:
+        if is_excluded_cluster_member(cluster.name, city.raw):
+            continue
         token = _postal_token(city, common_rating_city=cluster.name)
         key = token.casefold()
         if key in seen:
@@ -366,8 +434,85 @@ def _cluster_to_zone(cluster: CityCluster) -> PostalCodeZone:
     )
 
 
-def _all_lanes_zone(anchor: ParsedCity) -> PostalCodeZone:
-    return _country_postal_zone(_cluster_name_from_city(anchor), anchor.country)
+def _jp_all_lanes_exclusions(description: str) -> list[str]:
+    """Parse cities/regions excluded from an All JP lanes row (e.g. Except Osaka)."""
+    if not description or "except" not in description.lower():
+        return []
+    if "jp" not in description.lower() and not ALL_LANES_PATTERN.search(description):
+        return []
+    match = JP_LANE_EXCEPTION_PATTERN.search(description)
+    if not match:
+        return []
+    fragment = match.group(1).strip(" )")
+    known: dict[str, str] = {
+        "osaka": "Osaka",
+        "central": "Central",
+    }
+    exclusions: list[str] = []
+    lowered = fragment.casefold()
+    for key, label in known.items():
+        if key in lowered:
+            exclusions.append(label)
+    if exclusions:
+        return exclusions
+    return [fragment] if fragment else []
+
+
+def _jp_all_lanes_zone(name: str, *, lane_description: str) -> PostalCodeZone | None:
+    exclusions = _jp_all_lanes_exclusions(lane_description)
+    if not exclusions:
+        return None
+    return PostalCodeZone(
+        name=name,
+        country="JP",
+        postal_code=ALPHANUM_POSTAL,
+        excluded=", ".join(exclusions),
+    )
+
+
+def _jp_excluded_city_zone(city_name: str) -> PostalCodeZone:
+    return PostalCodeZone(
+        name=city_name,
+        country="JP",
+        postal_code=city_name,
+        excluded="",
+    )
+
+
+# Cities excluded from an All JP lanes row that also need their own postal zone.
+JP_EXCLUDED_COMPANION_CITIES = frozenset({"Osaka"})
+
+
+def _jp_exclusion_companion_zones(
+    exclusions: list[str],
+    existing_zones: list[PostalCodeZone],
+) -> list[PostalCodeZone]:
+    existing_keys = {(location_match_key(zone.name), zone.country.upper()) for zone in existing_zones}
+    companions: list[PostalCodeZone] = []
+    for city in exclusions:
+        if city not in JP_EXCLUDED_COMPANION_CITIES:
+            continue
+        key = (location_match_key(city), "JP")
+        if key in existing_keys:
+            continue
+        companions.append(_jp_excluded_city_zone(city))
+        existing_keys.add(key)
+    return companions
+
+
+def _all_lanes_zone(
+    anchor: ParsedCity,
+    *,
+    lane_country: str | None = None,
+    lane_description: str = "",
+) -> PostalCodeZone:
+    country = lane_country or anchor.country
+    name = _cluster_name_from_city(anchor)
+    if country == "JP":
+        jp_zone = _jp_all_lanes_zone(name, lane_description=lane_description)
+        if jp_zone is not None:
+            return jp_zone
+    return _country_postal_zone(name, country)
 
 
 def _country_postal_zone(name: str, country: str) -> PostalCodeZone:
@@ -446,20 +591,37 @@ def _zones_from_country_reference(country_ref: CountryReference) -> list[PostalC
     return zones
 
 
+def _cluster_regions(cluster: CityCluster) -> set[str]:
+    regions = {city.region for city in cluster.cities if city.region}
+    if regions:
+        return regions
+    for city in cluster.cities:
+        token = _postal_token(city, common_rating_city=cluster.name)
+        if "_" in token:
+            regions.add(token.split("_", 1)[0])
+    return regions
+
+
 def _build_regional_zones(
     regional_defs: list[RegionalZoneDef],
-    all_cities: list[ParsedCity],
+    clusters: list[CityCluster],
 ) -> list[PostalCodeZone]:
     zones: list[PostalCodeZone] = []
     for zone_def in regional_defs:
         excluded_tokens: list[str] = []
         seen_excl: set[str] = set()
-        if zone_def.uses_table_exclusions:
-            for city in all_cities:
-                if city.country != zone_def.country:
+        if zone_def.state_or_prov_codes:
+            for cluster in clusters:
+                if cluster.country != zone_def.country:
                     continue
-                if city.region in zone_def.state_or_prov_codes:
-                    token = _postal_token(city, common_rating_city=city.city)
+                if not _cluster_regions(cluster) & zone_def.state_or_prov_codes:
+                    continue
+                for city in cluster.cities:
+                    if is_misclassified_foreign_us_city(city.city, city.region, city.country):
+                        continue
+                    if is_excluded_cluster_member(cluster.name, city.raw):
+                        continue
+                    token = _postal_token(city, common_rating_city=cluster.name)
                     key = token.casefold()
                     if key in seen_excl:
                         continue
@@ -498,15 +660,73 @@ def build_postal_code_zones_from_raw(raw: pd.DataFrame) -> list[PostalCodeZone]:
         anchor = _parse_city_field(c0)
         if anchor is None:
             continue
-        zones.append(_all_lanes_zone(anchor))
+        lane_country = _normalize_country(match.group(1))
+        zones.append(_all_lanes_zone(anchor, lane_country=lane_country, lane_description=c1))
 
-    zones.extend(_build_regional_zones(regional_defs, all_cities))
+    zones.extend(_build_regional_zones(regional_defs, clusters))
 
     country_ref = extract_country_reference(raw)
     zones.extend(_zones_from_country_reference(country_ref))
 
+    zones = _apply_special_zone_overrides(zones, raw)
+
+    jp_exclusions: list[str] = []
+    for row_idx in range(start_row, end_row):
+        c1 = cell_text(raw.iloc[row_idx, 1]) if raw.shape[1] > 1 else ""
+        lane_match = ALL_LANES_PATTERN.search(c1)
+        if not lane_match:
+            continue
+        if _normalize_country(lane_match.group(1)) == "JP":
+            jp_exclusions.extend(_jp_all_lanes_exclusions(c1))
+    zones.extend(_jp_exclusion_companion_zones(jp_exclusions, zones))
+
     zones.sort(key=lambda zone: (zone.country, zone.name.casefold()))
     return zones
+
+
+def _apply_special_zone_overrides(zones: list[PostalCodeZone], raw: pd.DataFrame) -> list[PostalCodeZone]:
+    start_row, end_row = _find_table_bounds(raw)
+    tokyo_lane_description = ""
+    for row_idx in range(start_row, end_row):
+        c0 = cell_text(raw.iloc[row_idx, 0])
+        c1 = cell_text(raw.iloc[row_idx, 1]) if raw.shape[1] > 1 else ""
+        if location_match_key(c0) == "tokyo" and ALL_LANES_PATTERN.search(c1):
+            tokyo_lane_description = c1
+            break
+
+    updated: list[PostalCodeZone] = []
+    for zone in zones:
+        if (
+            tokyo_lane_description
+            and location_match_key(zone.name) == "tokyo"
+            and zone.country == "JP"
+        ):
+            jp_zone = _jp_all_lanes_zone(zone.name, lane_description=tokyo_lane_description)
+            if jp_zone is not None:
+                updated.append(jp_zone)
+                continue
+        if (
+            location_match_key(zone.name)
+            in FOREIGN_CITIES_BY_AMBIGUOUS_SUFFIX.get("IN", frozenset())
+            and zone.country == "US"
+        ):
+            cleaned_tokens = []
+            for part in zone.postal_code.split(", "):
+                token = part.strip()
+                if token.upper().startswith("IN_"):
+                    token = token[3:]
+                cleaned_tokens.append(token)
+            updated.append(
+                PostalCodeZone(
+                    name=zone.name,
+                    country="IN",
+                    postal_code=", ".join(cleaned_tokens),
+                    excluded=zone.excluded,
+                )
+            )
+            continue
+        updated.append(zone)
+    return updated
 
 
 def _matrix_city_labels(
@@ -556,6 +776,10 @@ def _is_valid_zone_name(name: str) -> bool:
     if any(marker in lower for marker in SKIP_ROW_MARKERS):
         return False
     if "origin " in lower and "destination" in lower:
+        return False
+    if METRO_AREA_PATTERN.search(text):
+        return False
+    if is_boilerplate_cluster_member(text):
         return False
     if len(text) > 100:
         return False
