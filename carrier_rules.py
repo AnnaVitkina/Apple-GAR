@@ -221,9 +221,33 @@ def apply_destination_airports(matrix_rows: list[dict[str, object]], carrier: Ca
     return updated
 
 
+RC_VALID_TO_COLUMN = "RC Valid To"
+
+
+def rc_valid_to_from_dataframe(df: pd.DataFrame) -> object | None:
+    if RC_VALID_TO_COLUMN not in df.columns:
+        return None
+    values = [value for value in df[RC_VALID_TO_COLUMN].dropna().tolist() if _cell_text(value)]
+    if not values:
+        return None
+    return max(values, key=_as_sortable_date)
+
+
 def _as_sortable_date(value: object):
     if isinstance(value, pd.Timestamp):
         return value.to_pydatetime()
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    text = _cell_text(value)
+    if not text:
+        return value
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text[:10], fmt)
+        except ValueError:
+            continue
     return value
 
 
@@ -234,7 +258,15 @@ def compute_lane_valid_to(
     transport_periods: list,
     fuel_periods: list,
     has_fuel_on_lane: bool,
+    rc_valid_to_override: object | None = None,
 ) -> str:
+    """Lane-level Valid to uses RC agreement end date when available."""
+    _ = (fuel_row, fuel_periods, has_fuel_on_lane)
+
+    for candidate in (rc_valid_to_override, source_row.get(RC_VALID_TO_COLUMN)):
+        if candidate is not None and not pd.isna(candidate) and _cell_text(candidate):
+            return _format_display_date(candidate)
+
     transport_dates: list[object] = []
     for period in transport_periods:
         col = f"Valid To{period.suffix}" if period.suffix else "Valid To"
@@ -242,17 +274,6 @@ def compute_lane_valid_to(
             value = source_row.get(col)
             if not pd.isna(value) and _cell_text(value):
                 transport_dates.append(value)
-
-    if has_fuel_on_lane and fuel_row is not None and fuel_periods:
-        fuel_dates: list[object] = []
-        for period in fuel_periods:
-            col = f"Valid To{period.suffix}" if period.suffix else "Valid To"
-            if col in fuel_row.index:
-                value = fuel_row.get(col)
-                if not pd.isna(value) and _cell_text(value):
-                    fuel_dates.append(value)
-        if fuel_dates:
-            return _format_display_date(max(fuel_dates, key=_as_sortable_date))
 
     if transport_dates:
         return _format_display_date(max(transport_dates, key=_as_sortable_date))
