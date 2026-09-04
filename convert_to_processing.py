@@ -48,6 +48,8 @@ VALUE_HEADER_PATTERN = re.compile(r"^Value\s*\(([^)]+)\)\s*$", re.IGNORECASE)
 PEAK_NONPEAK_PATTERN = re.compile(r"\b(?:non-peak|peak)\b", re.IGNORECASE)
 VALID_FROM_COLUMN = "Valid From"
 VALID_TO_COLUMN = "Valid To"
+RC_VALID_FROM_COLUMN = "RC Valid From"
+RC_VALID_TO_COLUMN = "RC Valid To"
 PERIOD_COLUMN = "Period"
 CALC_RULE_COLUMNS = (
     "Calculation Base",
@@ -338,6 +340,22 @@ def _format_metadata_date(value: object) -> object:
     return value
 
 
+def _metadata_sortable_date(value: object):
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    text = _cell_text(value)
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text[:10], fmt)
+        except ValueError:
+            continue
+    return text
+
+
 def _row_texts(row: pd.Series) -> list[str]:
     return [_cell_text(value).lower() for value in row]
 
@@ -381,6 +399,18 @@ def _extract_calc_rules(df_raw: pd.DataFrame, header_row_idx: int) -> CalcRules:
     return CalcRules(**values)
 
 
+def _dates_after_valid_to_label(row: pd.Series, label_col_idx: int) -> list[object]:
+    dates: list[object] = []
+    for candidate in row.iloc[label_col_idx + 1 :]:
+        if pd.isna(candidate):
+            continue
+        if _is_valid_to_label(_cell_text(candidate).lower()):
+            continue
+        if _cell_text(candidate):
+            dates.append(candidate)
+    return dates
+
+
 def extract_sheet_metadata(df_raw: pd.DataFrame, max_scan_rows: int = 50) -> SheetMetadata:
     metadata = SheetMetadata()
     scan_limit = min(len(df_raw), max_scan_rows)
@@ -405,14 +435,11 @@ def extract_sheet_metadata(df_raw: pd.DataFrame, max_scan_rows: int = 50) -> She
                         break
 
             if _is_valid_to_label(lower):
-                if col_idx + 1 < len(row):
-                    candidate = row.iloc[col_idx + 1]
-                    if pd.notna(candidate):
-                        metadata.valid_to = candidate
-                for candidate in row.iloc[col_idx + 1 :]:
-                    if pd.notna(candidate) and not _is_valid_to_label(_cell_text(candidate).lower()):
-                        metadata.valid_to = candidate
-                        break
+                dates_after = _dates_after_valid_to_label(row, col_idx)
+                if len(dates_after) == 1:
+                    metadata.valid_to = dates_after[0]
+                elif metadata.valid_to is None and dates_after:
+                    metadata.valid_to = max(dates_after, key=_metadata_sortable_date)
 
     header_row_idx = find_header_row_index(df_raw, max_scan_rows=max_scan_rows)
     if header_row_idx is not None:
@@ -636,6 +663,19 @@ def _attach_per_value_column_validity(
     return pd.concat(parts, axis=1)
 
 
+def _attach_rc_validity_columns(df: pd.DataFrame, metadata: SheetMetadata) -> pd.DataFrame:
+    """Sheet-level RC agreement dates (distinct from per-period peak/non-peak validity)."""
+    if metadata.valid_from is None and metadata.valid_to is None:
+        return df
+
+    enriched = df.copy()
+    if metadata.valid_to is not None:
+        enriched.insert(0, RC_VALID_TO_COLUMN, _format_metadata_date(metadata.valid_to))
+    if metadata.valid_from is not None:
+        enriched.insert(0, RC_VALID_FROM_COLUMN, _format_metadata_date(metadata.valid_from))
+    return enriched
+
+
 def _attach_validity_columns(
     df: pd.DataFrame,
     metadata: SheetMetadata,
@@ -795,7 +835,8 @@ def clean_standard_tab_df(df_raw: pd.DataFrame, metadata: SheetMetadata) -> pd.D
                 if _is_value_header_name(header) or _is_od_value_header_name(header)
             ],
         )
-    return _attach_calc_rules(result, metadata.calc_rules)
+    result = _attach_calc_rules(result, metadata.calc_rules)
+    return _attach_rc_validity_columns(result, metadata)
 
 
 def clean_tab_df(df_raw: pd.DataFrame, sheet_name: str | None = None) -> pd.DataFrame:
