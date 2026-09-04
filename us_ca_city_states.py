@@ -16,6 +16,8 @@ US_CITY_STATE: dict[str, str] = {
     "Northamption": "PA",
     "Oakland": "CA",
     "Ontario": "CA",
+    "Riverside": "CA",
+    "San Bernardino": "CA",
     "San Francisco": "CA",
     "Sparks": "NV",
 }
